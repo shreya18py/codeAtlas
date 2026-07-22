@@ -14,3 +14,6 @@ class GeneratedDocumentation(BaseModel):
     language: str
     documentation: str
     source: str
+
+class GithubRepo(BaseModel):
+    repo_url: str

@@ -1,6 +1,9 @@
 from fastapi import APIRouter, HTTPException, UploadFile, File
 from bson import ObjectId
 from pymongo import ASCENDING
+import tempfile
+import zipfile
+import os
 
 
 from app.database.database import docs_collection
@@ -9,6 +12,9 @@ from app.services.gemini_service import (
     generate_documentation,
     detect_language
 )
+from app.services.file_service import get_source_files
+from app.services.github_service import clone_repo
+from app.models.models import GithubRepo
 
 router = APIRouter()
 
@@ -191,3 +197,103 @@ async def upload_file(file: UploadFile = File(...)):
     "language": language,
     "documentation": documentation
 }
+
+#upload a folder
+@router.post("/upload-project")
+async def upload_project(file: UploadFile = File(...)):
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+
+        zip_path = os.path.join(temp_dir, file.filename)
+
+        with open(zip_path, "wb") as buffer:
+            buffer.write(await file.read())
+
+        with zipfile.ZipFile(zip_path, "r") as zip_ref:
+            zip_ref.extractall(temp_dir)
+
+        source_files = get_source_files(temp_dir)
+
+        # Temporary: process only first 3 files
+        source_files = source_files[:3]
+
+        generated_docs = []
+        
+        for file_path in source_files:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+               code = f.read()
+
+            filename = os.path.basename(file_path)
+
+            language = detect_language(filename)
+
+            documentation = generate_documentation(code)
+
+            docs_collection.insert_one({
+                "project": file.filename.replace(".zip", ""),
+                "filename": filename,
+                "language": language,
+                "documentation": documentation,
+                "source": "project_upload"
+                })
+            
+            generated_docs.append({
+                "filename": filename,
+                "language": language
+                })
+            
+        return {
+            "project": file.filename.replace(".zip", ""),
+            "files_processed": len(generated_docs),
+            "files": generated_docs
+            }
+
+
+#github repo
+@router.post("/github-docs")
+def github_docs(data: GithubRepo):
+
+    repo_path = clone_repo(data.repo_url)
+
+    source_files = get_source_files(repo_path)
+
+    # Temporary: avoid Gemini rate limit
+    source_files = source_files[:3]
+
+    generated_docs = []
+
+    repo_name = data.repo_url.split("/")[-1]
+
+    for file_path in source_files:
+
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            code = f.read()
+
+        filename = os.path.basename(file_path)
+
+        language = detect_language(filename)
+
+        try:
+            documentation = generate_documentation(code)
+        except Exception as e:
+            documentation = f"Documentation generation failed: {str(e)}"
+
+        docs_collection.insert_one({
+            "project": repo_name,
+            "filename": filename,
+            "language": language,
+            "documentation": documentation,
+            "source": "github_repo",
+            "repo_url": data.repo_url
+        })
+
+        generated_docs.append({
+            "filename": filename,
+            "language": language
+        })
+
+    return {
+        "repository": data.repo_url,
+        "files_processed": len(generated_docs),
+        "files": generated_docs
+    }
